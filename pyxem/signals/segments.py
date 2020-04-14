@@ -34,8 +34,7 @@ from pyxem.signals.diffraction_vectors import DiffractionVectors
 from pyxem.signals.electron_diffraction2d import ElectronDiffraction2D
 from pyxem.signals import transfer_signal_axes
 
-from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
-from scipy.spatial.distance import pdist
+from sklearn.cluster import DBSCAN
 
 
 class LearningSegment:
@@ -307,14 +306,16 @@ class VDFSegment:
         return ncc_sig
 
     def correlate_vdf_segments(self, corr_threshold=0.7, vector_threshold=4,
-                               segment_threshold=3, t_factor=0.7, return_corr_list=False):
+                               segment_threshold=3, distance_threshold=0.3, min_samples=1,
+                               return_corr_list=False):
         """Performs correlation matrix clustering of the segments to sum
         similar segments, subject to threshold criteria. The normalised
-        cross-correlation matrix of the VDF segments and the pairwise
-        Euclidean distances of the correlation matrix are calculated.
-        The distances are used for hierarchical clustering, in order
-        to identify clusters of similar segments. If segments in a cluster
-        have lower correlation score to other segments in the cluster than
+        cross-correlation matrix of the VDF segments is calculated.
+        The correlations are interpreted as distances (by taking the absolute
+        of the correlations after subtracting by 1) and used for clustering, in order
+        to identify clusters of similar segments. The clustering algorithm used here is
+        DBSCAN as implemented in sklearn.cluster. If segments in a cluster
+        have correlation scores to other cluster segments that are smaller than the
         correlation threshold, they will be discarded. Segments fulfilling
         the correlation threshold criteria will be summed. The vectors of
         each segment sum will be updated accordingly, so that the vectors of
@@ -339,10 +340,13 @@ class VDFSegment:
             found, are set to 0, i.e. the resulting segment will only
             have intensities above 0 where at least a number of
             segment_threshold segments have intensities above 0.
-        t_factor : float, optional
+        distance_threshold : float, optional
             Threshold that will be used to find flat clusters is given by
             t_factor times to maximum of the distance matrix. See the
-            documentation for scipy.cluster.hierarchy.fcluster for details.
+            documentation for sklearn.cluster.dbscan for details.
+        min_samples : int, optional
+            The minimum number of segments near a point for it to be considered a core point.
+            See the documentation for sklearn.cluster.dbscan for details.
         return_corr_list : bool, optional
             If True, an array containing the indices of the original segments that each correlated segment corresponds
             to, will be returned as the second variable.
@@ -358,10 +362,8 @@ class VDFSegment:
 
         """
         if segment_threshold > vector_threshold:
-            raise ValueError(
-                "segment_threshold must be smaller than or "
-                "equal to vector_threshold."
-            )
+            raise ValueError("segment_threshold must be smaller than or "
+                             "equal to vector_threshold.")
 
         vectors = self.vectors_of_segments.data
         segments = self.segments.data.copy()
@@ -374,14 +376,13 @@ class VDFSegment:
             vector_indices[i] = np.array([i], dtype=int)
         # Calculate the normalised correlation matrix
         corr_mat = self.get_ncc_matrix().data
-        # Calculate pairwise Euclidean distances matrix of the correlation matrix
-        corr_dist_mat = pdist(corr_mat, 'euclidean')
-        # Hierarchical clustering of the distances to get linkage
-        links = linkage(corr_dist_mat, method='complete')
+        # Simple correlation distance
+        corr_mate = abs(corr_mat - 1)
 
-        # Find flat clusters from the linkage
-        clusters = fcluster(links, t_factor * np.max(corr_dist_mat), 'distance')
-        cluster_indices_unique, cluster_counts = np.unique(clusters, return_counts=True)
+        # Find clusters of segments using DBSCAN
+        clusters = DBSCAN(min_samples=min_samples, eps=distance_threshold,
+                          metric="precomputed").fit(corr_mate)
+        cluster_indices_unique, cluster_counts = np.unique(clusters.labels_, return_counts=True)
         # Check which clusters have more than vector threshold number of entries:
         cluster_indices = cluster_indices_unique[np.where(cluster_counts >= vector_threshold)]
         num_clusters = np.shape(cluster_indices)[0]
@@ -394,10 +395,10 @@ class VDFSegment:
         # Iterate through the segment clusters that have more than
         # vector_threshold entries
         for num, cluster_index in zip(np.arange(num_clusters), cluster_indices):
-            segment_cluster_indices = np.where(clusters == cluster_index)
+            segment_cluster_indices = np.where(clusters.labels_ == cluster_index)
             # Extract the correlation matrix for only the segments in the cluster
-            corr_mat_cluster = corr_mat[:][np.where(clusters == cluster_index)]
-            corr_mat_cluster = corr_mat_cluster.T[np.where(clusters == cluster_index)].T
+            corr_mat_cluster = corr_mat[:][np.where(clusters.labels_ == cluster_index)]
+            corr_mat_cluster = corr_mat_cluster.T[np.where(clusters.labels_ == cluster_index)].T
             # Check if there are correlation scores below the correlation threshold
             if not np.all(corr_mat_cluster[corr_mat_cluster != 1] < corr_threshold):
                 if np.min(corr_mat_cluster) < corr_threshold:
