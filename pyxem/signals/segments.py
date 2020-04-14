@@ -260,10 +260,10 @@ class LearningSegment:
         segments = np.delete(segments, delete_indices, axis=0)
         factors_of_segments = np.delete(factors_of_segments, delete_indices, axis=0)
 
-        # if TraitError is raised, it is likely no segements were found
+        # if TraitError is raised, it is likely no segments were found
         segments = Signal2D(segments).transpose(navigation_axes=[0], signal_axes=[2, 1])
         factors_of_segments = Signal2D(factors_of_segments)
-        learning_segment = LearningSegment(segments, factors_of_segments)
+        learning_segment = LearningSegment(factors=factors_of_segments, loadings=segments)
         return learning_segment
 
 
