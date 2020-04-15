@@ -77,80 +77,120 @@ class LearningSegment:
 
         return ncc_sig
 
-    def correlate_learning_segments(self, corr_th_factors=0.4, corr_th_loadings=0.4):
-        """Iterates through the factors and loadings and calculates the
-        normalized cross-correlation between all factors and all
-        loadings. Factors and loadings are summed if the correlations of
-        both factors and loadings exceed the given thresholds.
+    def correlate_learning_segments(self, corr_threshold=(0.4, 0.4), min_samples=(1, 1), distance_threshold=(0.6, 0.6),
+                                    return_corr_list=False):
+        """Performs correlation clustering of the components to sum similar components, subject to threshold criteria.
+        The normalised cross-correlation matrices of the factors and loadings are calculated separately.
+        The correlations are interpreted as distances (by taking the absolute of the correlations after subtracting
+        by 1) and used for clustering separately. The clustering algorithm used is DBSCAN as implemented in
+        sklearn.cluster. The factor clusters are checked against the loadings clusters, so that the final
+        clusters only contain loadings and factors that were both assigned to the same cluster.
+        If factors or loadings in a cluster have internal correlation scores below the respective correlation
+        thresholds, they will be put in a new, separate cluster. Factors or loadings in a cluster fulfilling the
+        correlation threshold criteria will be summed.
 
         Parameters
         ----------
-        corr_th_factors : float
-            Correlation threshold for factors. Must be between -1 and 1.
-            Factors and loadings are summed if both factors and loadings
-            have normalized cross-correlations above corr_th_factors and
-            corr_th_loadings, respectively.
-        corr_th_loadings : int, optional
-            Correlation threshold for loadings. Must be between -1 and 1.
+        corr_threhold : tuple of float
+            Correlation threshold for summation of factors and loadings, respectively.
+            Must be between -1 and 1.
+        min_samples : tuple of int
+            The minimum number of factors and loadings, respectively, near a point for it to be considered a core point.
+            See the documentation for sklearn.cluster.dbscan for details.
+        distance_threshold : tuple of float
+            The maximum correlation distance between two components for them to be considered to be in the same cluster.
+            See the documentation for sklearn.cluster.dbscan for details.
+        return_corr_list : bool, optional
+            If True, an array containing the indices of the original components that each correlated component
+            corresponds to, will be returned as the second variable.
 
         Returns
         -------
         learning_segment : LearningSegment
             LearningSegment where possibly some factors and loadings
             have been summed.
+        corr_list : ndarray
+            Array of the indices of the components that each correlated component corresponds to.
+            The array is returned only if return_corr_list is True.
+
         """
         # If a mask was used during the decomposition, the factors and/or
         # loadings will contain nan, which must be converted to numbers prior
-        # to the correlations calculations.
+        # to the correlation calculations.
         factors = self.factors.map(np.nan_to_num, inplace=False)
         loadings = self.loadings.map(np.nan_to_num, inplace=False)
-        factors = factors.copy().data
-        loadings = loadings.copy().data
-        correlated_loadings = np.zeros_like(loadings[:1])
-        correlated_factors = np.zeros_like(factors[:1])
 
-        # For each loading and factor, calculate the normalized
-        # cross-correlation to all other loadings and factors, and define
-        # add_indices for those with a value above corr_th_loadings and
-        # corr_th_factors respectively.
-        while np.shape(loadings)[0] > 0:
-            corr_list_loadings = list(
-                map(lambda x: norm_cross_corr(x, template=loadings[0]), loadings)
-            )
-            corr_list_factors = list(
-                map(lambda x: norm_cross_corr(x, template=factors[0]), factors)
-            )
+        # Calculate the normalised correlation matrix
+        corr_mat = LearningSegment(factors, loadings).get_ncc_matrix().data
+        # Simple correlation distance
+        corr_mat_dist = abs(corr_mat - 1)
 
-            add_indices = np.where(
-                list(
-                    map(
-                        lambda l, f: (l > corr_th_loadings and f > corr_th_factors),
-                        corr_list_loadings,
-                        corr_list_factors,
-                    )
-                )
-            )
+        # Find clusters of factors using DBSCAN
+        factors_clusters = DBSCAN(min_samples=min_samples[0], eps=distance_threshold[0],
+                                  metric="precomputed").fit(corr_mat_dist[0])
 
-            correlated_loadings = np.append(
-                correlated_loadings,
-                np.array([np.sum(loadings[add_indices], axis=0)]),
-                axis=0,
-            )
-            correlated_factors = np.append(
-                correlated_factors,
-                np.array([np.sum(factors[add_indices], axis=0)]),
-                axis=0,
-            )
+        # Find clusters of loadings using DBSCAN
+        loadings_clusters = DBSCAN(min_samples=min_samples[1], eps=distance_threshold[1],
+                                   metric="precomputed").fit(corr_mat_dist[1])
 
-            loadings = np.delete(loadings, add_indices, axis=0)
-            factors = np.delete(factors, add_indices, axis=0)
+        # The final clusters are groups of components that are in the same cluster based on both the loadings and
+        # factors. For each cluster found based on the factors, check which components are are in the same cluster in
+        # loadings and group those into a final cluster.
+        clusters = np.zeros_like(factors_clusters.labels_) - 1
+        n = 0
+        for cluster_num in np.arange(np.max(factors_clusters.labels_)):
+            cluster_indices = factors_clusters.core_sample_indices_[factors_clusters.labels_ == cluster_num]
+            cluster_num_loadings = np.sort(np.unique(loadings_clusters.labels_[cluster_indices]))
+            for num_load in cluster_num_loadings:
+                clusters[cluster_indices[np.where(loadings_clusters.labels_[cluster_indices] == num_load)]] = n
+                n += 1
 
-        correlated_loadings = Signal2D(np.delete(correlated_loadings, 0, axis=0))
-        correlated_factors = Signal2D(np.delete(correlated_factors, 0, axis=0))
-        learning_segment = LearningSegment(
-            factors=correlated_factors, loadings=correlated_loadings
-        )
-        return learning_segment
+        # DBSCAN can assign some components to noise (label -1), but we want these to belong to separate clusters.
+        if np.min(clusters) == -1:
+            clusters[clusters == -1] = np.arange(n, n + len(clusters[clusters == -1]))
+
+        # Extract the correlation matrix for the factors and loadings in each cluster and ensure that they are all
+        # above the correlation thresholds.
+        for cluster_num in np.sort(np.unique(clusters)):
+            # Check the factors first and then loadings separately:
+            for i in (0, 1):
+                if len(clusters[clusters == cluster_num]) > 1:
+                    corr_mat_cluster = corr_mat[i][:][np.where(clusters == cluster_num)]
+                    corr_mat_cluster = corr_mat_cluster.T[np.where(clusters == cluster_num)].T
+
+                    # Check if there are correlation scores below the correlation threshold.
+                    # If so, put the components that gives lowest average value to all the others in a new cluster.
+                    # Here, we assume that the initial DBSCAN clustering was good enough that the lowest average value
+                    # components should not constitute their own new cluster, but be placed in separate ones for
+                    # simplicity.
+                    if np.min(corr_mat_cluster) < corr_threshold[i]:
+                        out_indices = []
+                        while np.min(corr_mat_cluster) < corr_threshold[i]:
+                            corr_mat_cluster_averages = np.average(corr_mat_cluster, axis=1)
+                            out_index = np.where(corr_mat_cluster_averages == np.min(corr_mat_cluster_averages))[0]
+                            out_indices.append(out_index)
+                            clusters[clusters == cluster_num][out_index] = n
+                            corr_mat_cluster = np.delete(corr_mat_cluster, out_index, axis=0)
+                            corr_mat_cluster = np.delete(corr_mat_cluster, out_index, axis=1)
+                            n += 1
+
+        correlated_factors = np.zeros(np.append(np.max(clusters) + 1, np.shape(factors.data)[1:]))
+        correlated_loadings = np.zeros(np.append(np.max(clusters) + 1, np.shape(loadings.data)[1:]))
+        corr_list = np.zeros(np.max(clusters) + 1, dtype=np.object)
+        for m in np.unique(clusters):
+            m_indices = np.where(clusters == m)[0]
+            if len(m_indices) > 1:
+                correlated_factors[m] = np.sum(self.factors.data[m_indices], axis=0)
+                correlated_loadings[m] = np.sum(self.loadings.data[m_indices], axis=0)
+            else:
+                correlated_factors[m] = self.factors.data[m_indices]
+                correlated_loadings[m] = self.loadings.data[m_indices]
+            corr_list[m] = m_indices
+        learning_segment = LearningSegment(factors=Signal2D(correlated_factors), loadings=Signal2D(correlated_loadings))
+        if return_corr_list:
+            return learning_segment, corr_list
+        else:
+            return learning_segment
 
     def separate_learning_segments(
         self,
@@ -341,9 +381,8 @@ class VDFSegment:
             have intensities above 0 where at least a number of
             segment_threshold segments have intensities above 0.
         distance_threshold : float, optional
-            Threshold that will be used to find flat clusters is given by
-            t_factor times to maximum of the distance matrix. See the
-            documentation for sklearn.cluster.dbscan for details.
+            The maximum correlation distance between two segments for them to be considered to be in the same cluster.
+            See the documentation for sklearn.cluster.dbscan for details.
         min_samples : int, optional
             The minimum number of segments near a point for it to be considered a core point.
             See the documentation for sklearn.cluster.dbscan for details.
@@ -377,11 +416,11 @@ class VDFSegment:
         # Calculate the normalised correlation matrix
         corr_mat = self.get_ncc_matrix().data
         # Simple correlation distance
-        corr_mate = abs(corr_mat - 1)
+        corr_mat_dist = abs(corr_mat - 1)
 
         # Find clusters of segments using DBSCAN
         clusters = DBSCAN(min_samples=min_samples, eps=distance_threshold,
-                          metric="precomputed").fit(corr_mate)
+                          metric="precomputed").fit(corr_mat_dist)
         cluster_indices_unique, cluster_counts = np.unique(clusters.labels_, return_counts=True)
         # Check which clusters have more than vector threshold number of entries:
         cluster_indices = cluster_indices_unique[np.where(cluster_counts >= vector_threshold)]
